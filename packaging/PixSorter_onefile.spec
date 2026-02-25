@@ -55,3 +55,7 @@ exe = EXE(
     console=False,
     icon=str(ico) if ico.exists() else None,
 )
+
+model = PKG / "assets" / "models" / "face_landmarker.task"
+if model.exists():
+    datas.append((str(model), "pixsorter/assets/models"))
