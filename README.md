@@ -13,14 +13,14 @@ PixSorter helps you:
 
 ## What it does
 
-### ✅ 1) Groups duplicates (fast → accurate)
+### 1) Groups duplicates (fast → accurate)
 PixSorter uses a two-stage approach:
 1. **CLIP embeddings** to quickly find candidate neighbors (cosine similarity)
 2. **ORB + homography (RANSAC) verification** to confirm “same frame” matches
 
 Then it builds connected components to form duplicate groups.
 
-### ✅ 2) Exports a clean folder structure
+### 2) Exports a clean folder structure
 Given an output folder, PixSorter writes:
 
 ```
@@ -36,7 +36,7 @@ Output/
 - `SINGLES` contains photos not assigned to any group
 - `BEST_OF` contains TOP-K picks per group (copy) if enabled
 
-### ✅ 3) Picks BEST-OF images (optional)
+### 3) Picks BEST-OF images (optional)
 For each group, PixSorter scores photos based on:
 - **Sharpness** (focus, ROI-based)
 - **Composition** (saliency centroid, rule-of-thirds / golden ratio proximity, leading lines)
