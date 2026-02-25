@@ -20,6 +20,7 @@ from ..vision.orb import orb_verify_same_frame
 from ..vision.scoring import best_of_score
 from ..ml.clip_embedder import ClipEmbedder
 from .planner import ProgressPlan
+from ..vision.motion_blur import assess_motion_blur
 
 
 class SortWorker(QObject):
@@ -245,13 +246,23 @@ class SortWorker(QObject):
                                 face_boxes = fb
                                 eyes_frac = ef
 
+                            mb = assess_motion_blur(rgb)
+                            tag = mb["label"]
+                            
                             s = best_of_score(
                                 rgb=rgb,
                                 face_bboxes=face_boxes,
                                 eyes_open_frac=eyes_frac,
                                 eyes_weight=self.cfg.eyes_weight
                             )
-                            scored.append((s, p))
+                            
+                            # Penalize faulty motion blur, lightly penalize intentional (or don’t)
+                            if tag == "MB_FAULTY":
+                                s *= 0.70
+                            elif tag == "MB_INTENTIONAL":
+                                s *= 0.92
+                            
+                            scored.append((s, p, tag))
                         except Exception:
                             continue
 
@@ -262,7 +273,8 @@ class SortWorker(QObject):
                     scored.sort(reverse=True, key=lambda x: x[0])
 
                     chosen: list[Path] = []
-                    for score, cand in scored:
+                    tag_map = {}
+                    for score, cand, tag in scored:
                         if self._check_cancel():
                             return
 
@@ -296,10 +308,13 @@ class SortWorker(QObject):
                                 pass
 
                         chosen.append(cand)
+                        tag_map[cand] = tag
 
                     group_name = gd.name
                     for rank, p in enumerate(chosen, start=1):
-                        dest = best_dir / f"{group_name}__top{rank:02d}__{p.name}"
+                        tag = tag_map.get(p, "")  # explained below
+                        tag_part = f"__{tag}" if tag else ""
+                        dest = best_dir / f"{group_name}__top{rank:02d}{tag_part}__{p.name}"
                         if dest.exists():
                             dest = best_dir / f"{group_name}__top{rank:02d}__{p.stem}__DUP{p.suffix}"
                         shutil.copy2(str(p), str(dest))

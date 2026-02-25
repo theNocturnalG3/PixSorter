@@ -1,4 +1,5 @@
 from pathlib import Path
+import time
 
 from PySide6.QtCore import Qt, QThread
 from PySide6.QtGui import QIcon, QAction
@@ -240,6 +241,10 @@ class MainWindow(QMainWindow):
         self.stage_label = QLabel("Idle")
         self.stage_label.setObjectName("Stage")
         right.addWidget(self.stage_label)
+        
+        self.eta_label = QLabel("ETA: --")
+        self.eta_label.setObjectName("Eta")
+        right.addWidget(self.eta_label)
 
         self.pbar = QProgressBar()
         self.pbar.setRange(0, 100)
@@ -253,6 +258,60 @@ class MainWindow(QMainWindow):
 
         self._setup_menu()
         self.apply_recommended()
+
+    def on_progress(self, p: int):
+        p = max(0, min(int(p), 100))
+        self.pbar.setValue(p)
+    
+        now = time.time()
+        if p <= 0:
+            self._eta_last_t = now
+            self._eta_last_p = p
+            self._eta_rate_ema = None
+            self.eta_label.setText("ETA: --")
+            return
+    
+        if self._eta_last_t is None or self._eta_last_p is None:
+            self._eta_last_t = now
+            self._eta_last_p = p
+            return
+    
+        dt = now - self._eta_last_t
+        dp = p - self._eta_last_p
+    
+        # ignore tiny/noisy updates
+        if dt < 0.35 or dp <= 0:
+            return
+    
+        rate = dp / dt  # % per second
+        alpha = 0.25    # EMA smoothing
+        self._eta_rate_ema = rate if self._eta_rate_ema is None else (alpha * rate + (1 - alpha) * self._eta_rate_ema)
+    
+        self._eta_last_t = now
+        self._eta_last_p = p
+    
+        if p >= 100:
+            self.eta_label.setText("ETA: 0s")
+            return
+    
+        if not self._eta_rate_ema or self._eta_rate_ema <= 1e-6:
+            self.eta_label.setText("ETA: --")
+            return
+    
+        remaining_s = (100 - p) / self._eta_rate_ema
+        self.eta_label.setText(f"ETA: {self._fmt_seconds(remaining_s)}")
+    
+    @staticmethod
+    def _fmt_seconds(secs: float) -> str:
+        secs = max(0, int(secs + 0.5))
+        h = secs // 3600
+        m = (secs % 3600) // 60
+        s = secs % 60
+        if h:
+            return f"{h}h {m}m"
+        if m:
+            return f"{m}m {s}s"
+        return f"{s}s"
 
     def _setup_menu(self):
         menubar = self.menuBar()
@@ -334,7 +393,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Invalid configuration", "• " + "\n• ".join(errs))
             return False
         return True
-    
+
     def start(self):
         cfg = self.collect_cfg()
         if not self.validate_cfg(cfg):
@@ -343,6 +402,11 @@ class MainWindow(QMainWindow):
         self.log_view.clear()
         self.pbar.setValue(0)
         self.stage_label.setText("Starting…")
+        
+        self._eta_last_t = None
+        self._eta_last_p = None
+        self._eta_rate_ema = None   # % per second
+        self.eta_label.setText("ETA: --")
 
         self.run_btn.setEnabled(False)
         self.reco_btn.setEnabled(False)
@@ -353,7 +417,7 @@ class MainWindow(QMainWindow):
         self.worker.moveToThread(self.worker_thread)
 
         self.worker_thread.started.connect(self.worker.run)
-        self.worker.progress.connect(self.pbar.setValue)
+        self.worker.progress.connect(self.on_progress)
         self.worker.stage.connect(self.stage_label.setText)
         self.worker.log.connect(self.append_log)
         self.worker.finished.connect(self.on_finished)
