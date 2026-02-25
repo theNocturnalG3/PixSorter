@@ -1,0 +1,17 @@
+PySide6>=6.5
+numpy>=1.24
+pillow>=10.0
+scikit-learn>=1.3
+opencv-python>=4.8
+tqdm>=4.66
+
+[clip]
+torch
+torchvision
+open_clip_torch
+
+[eyes]
+mediapipe>=0.10
+
+[heic]
+pillow-heif>=0.15
