@@ -6,6 +6,7 @@ from .saliency import saliency_map
 
 
 def laplacian_var(gray: np.ndarray) -> float:
+    gray = cv2.GaussianBlur(gray, (0, 0), 1.0) 
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 

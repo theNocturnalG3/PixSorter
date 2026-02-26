@@ -1,26 +1,25 @@
 # src/pixsorter/pipeline/worker.py
 from __future__ import annotations
 
-import time
 import shutil
+import time
 import traceback
-from pathlib import Path
 from collections import defaultdict
+from pathlib import Path
 
 import numpy as np
-from sklearn.neighbors import NearestNeighbors
-
 from PySide6.QtCore import QObject, Signal
+from sklearn.neighbors import NearestNeighbors
 
 from ..config.defaults import SortConfig
 from ..infra.resources import is_image
-from ..vision.io import load_rgb, rgb_to_gray, resize_max_side
+from ..ml.clip_embedder import ClipEmbedder
 from ..vision.grouping import connected_components
+from ..vision.io import load_rgb, resize_max_side, rgb_to_gray
+from ..vision.motion_blur import assess_motion_blur
 from ..vision.orb import orb_verify_same_frame
 from ..vision.scoring import best_of_score
-from ..ml.clip_embedder import ClipEmbedder
 from .planner import ProgressPlan
-from ..vision.motion_blur import assess_motion_blur
 
 
 class SortWorker(QObject):
@@ -78,7 +77,7 @@ class SortWorker(QObject):
             except Exception as e:
                 self.finished.emit(
                     False,
-                    f"CLIP not available. Install extras: pip install \"pixsorter[clip]\". ({e})"
+                    f"CLIP not available. Install extras: pip install \"pixsorter[clip]\". ({e})",
                 )
                 return
 
@@ -109,7 +108,7 @@ class SortWorker(QObject):
             E = np.vstack(embs)
             nn = NearestNeighbors(
                 n_neighbors=min(self.cfg.knn_k + 1, len(kept_paths)),
-                metric="cosine"
+                metric="cosine",
             )
             nn.fit(E)
 
@@ -124,7 +123,7 @@ class SortWorker(QObject):
                 if self._check_cancel():
                     return
 
-                dists, idxs = nn.kneighbors(E[i:i + 1], return_distance=True)
+                dists, idxs = nn.kneighbors(E[i : i + 1], return_distance=True)
                 for dist, j in zip(dists[0][1:], idxs[0][1:]):
                     sim = 1.0 - float(dist)
                     if sim < self.cfg.clip_sim_thresh:
@@ -139,10 +138,11 @@ class SortWorker(QObject):
                         g2 = rgb_to_gray(rgb2)
 
                         same, _, _ = orb_verify_same_frame(
-                            g1, g2,
+                            g1,
+                            g2,
                             orb_nfeatures=self.cfg.orb_nfeatures,
                             match_ratio=self.cfg.orb_match_thresh,
-                            min_inliers=self.cfg.min_inliers
+                            min_inliers=self.cfg.min_inliers,
                         )
                         if same:
                             edges[i].append(j)
@@ -215,12 +215,17 @@ class SortWorker(QObject):
                 if self.cfg.use_eyes:
                     try:
                         from ..ml.eyes import FaceEyeAnalyzer
+
                         analyzer = FaceEyeAnalyzer()
                     except Exception as e:
                         self._emit(
                             f"[WARN] Eyes-open not available (install extras: pixsorter[eyes]). ({e})"
                         )
                         analyzer = None
+
+                # Blur gate thresholds (0..1 where higher = blurrier)
+                CLEAN_MAX = 0.18       # very strict: preferred candidates
+                ACCEPT_MAX = 0.32      # still acceptable; below this we try to fill TOP-K
 
                 for gi, gd in enumerate(group_dirs):
                     if self._check_cancel():
@@ -231,7 +236,8 @@ class SortWorker(QObject):
                         self.progress.emit(plan.best_pct(gi + 1, len(group_dirs)))
                         continue
 
-                    scored: list[tuple[float, Path]] = []
+                    # (score, path, tag, blur_amount)
+                    scored: list[tuple[float, Path, str, float]] = []
                     for p in imgs:
                         if self._check_cancel():
                             return
@@ -246,23 +252,27 @@ class SortWorker(QObject):
                                 face_boxes = fb
                                 eyes_frac = ef
 
-                            mb = assess_motion_blur(rgb)
-                            tag = mb["label"]
-                            
+                            mb = assess_motion_blur(rgb) or {}
+                            tag = str(mb.get("label", "") or "")
+                            blur = float(mb.get("blur_amount", 0.0) or 0.0)
+
                             s = best_of_score(
                                 rgb=rgb,
                                 face_bboxes=face_boxes,
                                 eyes_open_frac=eyes_frac,
-                                eyes_weight=self.cfg.eyes_weight
+                                eyes_weight=self.cfg.eyes_weight,
                             )
-                            
-                            # Penalize faulty motion blur, lightly penalize intentional (or don’t)
+
+                            # Soft penalty for any blur (prevents “slightly blurred but good composition” from winning)
+                            s = max(0.0, s - 0.35 * blur)
+
+                            # Extra penalties by motion-blur label
                             if tag == "MB_FAULTY":
-                                s *= 0.70
+                                s = max(0.0, s - 0.35 * blur - 0.10)
                             elif tag == "MB_INTENTIONAL":
-                                s *= 0.92
-                            
-                            scored.append((s, p, tag))
+                                s = max(0.0, s - 0.10 * blur)
+
+                            scored.append((s, p, tag, blur))
                         except Exception:
                             continue
 
@@ -273,46 +283,75 @@ class SortWorker(QObject):
                     scored.sort(reverse=True, key=lambda x: x[0])
 
                     chosen: list[Path] = []
-                    tag_map = {}
-                    for score, cand, tag in scored:
-                        if self._check_cancel():
-                            return
+                    tag_map: dict[Path, str] = {}
+
+                    def passes_diversity(cand: Path) -> bool:
+                        if not self.cfg.diverse or not chosen:
+                            return True
+                        try:
+                            rgb_c = resize_max_side(load_rgb(cand), self.cfg.max_side_verify)
+                            g_c = rgb_to_gray(rgb_c)
+
+                            for prev in chosen:
+                                rgb_p = resize_max_side(load_rgb(prev), self.cfg.max_side_verify)
+                                g_p = rgb_to_gray(rgb_p)
+                                same, _, _ = orb_verify_same_frame(
+                                    g_c,
+                                    g_p,
+                                    orb_nfeatures=self.cfg.orb_nfeatures,
+                                    match_ratio=self.cfg.orb_match_thresh,
+                                    min_inliers=self.cfg.diverse_inliers,
+                                )
+                                if same:
+                                    return False
+                            return True
+                        except Exception:
+                            # if diversity check fails, don't block selection
+                            return True
+
+                    # Bucket selection order: clean -> acceptable -> intentional -> other non-faulty -> faulty
+                    buckets: list[list[tuple[float, Path, str, float]]] = []
+
+                    buckets.append([t for t in scored if t[2] != "MB_FAULTY" and t[3] <= CLEAN_MAX])
+                    buckets.append(
+                        [t for t in scored if t[2] != "MB_FAULTY" and CLEAN_MAX < t[3] <= ACCEPT_MAX]
+                    )
+                    buckets.append([t for t in scored if t[2] == "MB_INTENTIONAL"])
+                    buckets.append([t for t in scored if t[2] not in ("MB_FAULTY", "MB_INTENTIONAL")])
+                    buckets.append([t for t in scored if t[2] == "MB_FAULTY"])
+
+                    seen: set[Path] = set()
+                    used_faulty = False
+
+                    for b in buckets:
+                        for score, cand, tag, blur in b:
+                            if self._check_cancel():
+                                return
+                            if len(chosen) >= self.cfg.top_k:
+                                break
+                            if cand in seen:
+                                continue
+                            seen.add(cand)
+
+                            if not passes_diversity(cand):
+                                continue
+
+                            chosen.append(cand)
+                            tag_map[cand] = tag
+                            if tag == "MB_FAULTY":
+                                used_faulty = True
 
                         if len(chosen) >= self.cfg.top_k:
                             break
 
-                        if self.cfg.diverse and chosen:
-                            # Skip if too similar to any already chosen
-                            try:
-                                rgb_c = resize_max_side(load_rgb(cand), self.cfg.max_side_verify)
-                                g_c = rgb_to_gray(rgb_c)
-
-                                too_sim = False
-                                for prev in chosen:
-                                    rgb_p = resize_max_side(load_rgb(prev), self.cfg.max_side_verify)
-                                    g_p = rgb_to_gray(rgb_p)
-                                    same, inliers, _ = orb_verify_same_frame(
-                                        g_c, g_p,
-                                        orb_nfeatures=self.cfg.orb_nfeatures,
-                                        match_ratio=self.cfg.orb_match_thresh,
-                                        min_inliers=self.cfg.diverse_inliers
-                                    )
-                                    if same:
-                                        too_sim = True
-                                        break
-
-                                if too_sim:
-                                    continue
-                            except Exception:
-                                # if diversity check fails, don't block selection
-                                pass
-
-                        chosen.append(cand)
-                        tag_map[cand] = tag
+                    if used_faulty:
+                        self._emit(
+                            f"[WARN] {gd.name}: Not enough low-blur images; BEST_OF includes motion-blur shots."
+                        )
 
                     group_name = gd.name
                     for rank, p in enumerate(chosen, start=1):
-                        tag = tag_map.get(p, "")  # explained below
+                        tag = tag_map.get(p, "")
                         tag_part = f"__{tag}" if tag else ""
                         dest = best_dir / f"{group_name}__top{rank:02d}{tag_part}__{p.name}"
                         if dest.exists():
